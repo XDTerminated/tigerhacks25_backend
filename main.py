@@ -1,11 +1,11 @@
 """
-Planet Evolution Game Backend API
-Handles user management and game run statistics
+Social Deduction Space Game Backend API
+Handles user management, player stats, and chat history
 """
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List
 from datetime import datetime
 import os
@@ -37,10 +37,10 @@ async def lifespan(app: FastAPI):
     """Manage database connection pool lifecycle"""
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
-    print(" Database connection pool created")
+    print("✅ Database connection pool created")
     yield
     await db_pool.close()
-    print("L Database connection pool closed")
+    print("❌ Database connection pool closed")
 
 
 # ============================================================================
@@ -48,8 +48,8 @@ async def lifespan(app: FastAPI):
 # ============================================================================
 
 app = FastAPI(
-    title="Planet Evolution Game API",
-    description="Backend API for planet evolution game with Auth0 integration",
+    title="Social Deduction Space Game API",
+    description="Backend API for social deduction space survival game",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -84,70 +84,47 @@ async def get_db():
 
 class UserCreate(BaseModel):
     """Request model for creating a user"""
-
-    auth0_id: str = Field(..., description="Auth0 user ID")
-    email: Optional[str] = None
-    username: Optional[str] = None
+    email: EmailStr = Field(..., description="User email address")
 
 
 class UserResponse(BaseModel):
     """Response model for user data"""
-
-    id: int
-    auth0_id: str
-    email: Optional[str]
-    username: Optional[str]
+    email: str
+    last_login: datetime
     created_at: datetime
+
+
+class PlayerStatsResponse(BaseModel):
+    """Response model for player statistics"""
+    email: str
+    correct_guesses: int
+    correct_ejections: int
+    incorrect_guesses: int
     updated_at: datetime
 
 
-class GameRunCreate(BaseModel):
-    """Request model for creating a game run"""
-
-    auth0_id: str = Field(..., description="Auth0 user ID")
-    completed: bool = Field(..., description="Whether the planet became habitable")
-    time_to_habitable: Optional[int] = Field(
-        None, description="Seconds to achieve habitability (null if failed)"
-    )
-    habitability_score: float = Field(
-        ..., ge=0, le=100, description="Final habitability score (0-100)"
-    )
-    run_duration: int = Field(..., description="Total run duration in seconds")
+class ChatMessageCreate(BaseModel):
+    """Request model for creating a chat message"""
+    email: EmailStr = Field(..., description="User email")
+    speaker: str = Field(..., description="Speaker name (player or NPC name)")
+    message: str = Field(..., description="Message content")
 
 
-class GameRunResponse(BaseModel):
-    """Response model for game run data"""
-
+class ChatMessageResponse(BaseModel):
+    """Response model for chat message"""
     id: int
-    user_id: int
-    completed: bool
-    time_to_habitable: Optional[int]
-    habitability_score: float
-    run_duration: int
-    started_at: datetime
-    ended_at: datetime
-    created_at: datetime
+    email: str
+    speaker: str
+    message: str
+    timestamp: datetime
 
 
-class LeaderboardEntry(BaseModel):
-    """Response model for leaderboard entries"""
-
-    username: Optional[str]
-    habitability_score: float
-    time_to_habitable: Optional[int]
-    completed: bool
-    created_at: datetime
-
-
-class UserStatsResponse(BaseModel):
-    """Response model for user statistics"""
-
-    total_runs: int
-    completed_runs: int
-    failed_runs: int
-    best_score: Optional[float]
-    fastest_time: Optional[int]
-    average_score: Optional[float]
+class StatsUpdate(BaseModel):
+    """Request model for updating player stats"""
+    email: EmailStr
+    correct_guesses: Optional[int] = None
+    correct_ejections: Optional[int] = None
+    incorrect_guesses: Optional[int] = None
 
 
 # ============================================================================
@@ -155,131 +132,152 @@ class UserStatsResponse(BaseModel):
 # ============================================================================
 
 
-async def get_or_create_user(
-    conn: asyncpg.Connection, auth0_id: str, email: Optional[str], username: Optional[str]
-) -> dict:
+async def get_or_create_user(conn: asyncpg.Connection, email: str) -> dict:
     """Get existing user or create new one"""
     # Try to get existing user
     user = await conn.fetchrow(
         """
-        SELECT id, auth0_id, email, username, created_at, updated_at
+        SELECT email, last_login, created_at
         FROM users
-        WHERE auth0_id = $1
+        WHERE email = $1
         """,
-        auth0_id,
+        email,
     )
 
     if user:
-        # Update user info if provided
-        if email or username:
-            user = await conn.fetchrow(
-                """
-                UPDATE users
-                SET email = COALESCE($2, email),
-                    username = COALESCE($3, username),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE auth0_id = $1
-                RETURNING id, auth0_id, email, username, created_at, updated_at
-                """,
-                auth0_id,
-                email,
-                username,
-            )
+        # Update last login
+        user = await conn.fetchrow(
+            """
+            UPDATE users
+            SET last_login = CURRENT_TIMESTAMP
+            WHERE email = $1
+            RETURNING email, last_login, created_at
+            """,
+            email,
+        )
         return dict(user)
 
-    # Create new user
-    user = await conn.fetchrow(
-        """
-        INSERT INTO users (auth0_id, email, username)
-        VALUES ($1, $2, $3)
-        RETURNING id, auth0_id, email, username, created_at, updated_at
-        """,
-        auth0_id,
-        email,
-        username,
-    )
+    # Create new user and initialize stats
+    async with conn.transaction():
+        user = await conn.fetchrow(
+            """
+            INSERT INTO users (email)
+            VALUES ($1)
+            RETURNING email, last_login, created_at
+            """,
+            email,
+        )
+
+        # Initialize player stats
+        await conn.execute(
+            """
+            INSERT INTO player_stats (email)
+            VALUES ($1)
+            """,
+            email,
+        )
 
     return dict(user)
 
 
-async def create_game_run(conn: asyncpg.Connection, user_id: int, run_data: GameRunCreate) -> dict:
-    """Create a new game run record"""
-    game_run = await conn.fetchrow(
-        """
-        INSERT INTO game_runs (
-            user_id, completed, time_to_habitable, habitability_score, run_duration
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, user_id, completed, time_to_habitable, habitability_score,
-                  run_duration, started_at, ended_at, created_at
-        """,
-        user_id,
-        run_data.completed,
-        run_data.time_to_habitable,
-        run_data.habitability_score,
-        run_data.run_duration,
-    )
-
-    return dict(game_run)
-
-
-async def get_user_stats(conn: asyncpg.Connection, user_id: int) -> dict:
-    """Get statistics for a user"""
+async def get_player_stats(conn: asyncpg.Connection, email: str) -> dict:
+    """Get player statistics"""
     stats = await conn.fetchrow(
         """
-        SELECT
-            COUNT(*) as total_runs,
-            COUNT(*) FILTER (WHERE completed = true) as completed_runs,
-            COUNT(*) FILTER (WHERE completed = false) as failed_runs,
-            MAX(habitability_score) as best_score,
-            MIN(time_to_habitable) FILTER (WHERE completed = true) as fastest_time,
-            AVG(habitability_score) as average_score
-        FROM game_runs
-        WHERE user_id = $1
+        SELECT email, correct_guesses, correct_ejections, incorrect_guesses, updated_at
+        FROM player_stats
+        WHERE email = $1
         """,
-        user_id,
+        email,
     )
+
+    if not stats:
+        raise HTTPException(status_code=404, detail="Player stats not found")
 
     return dict(stats)
 
 
-async def get_leaderboard(conn: asyncpg.Connection, limit: int = 100) -> List[dict]:
-    """Get top scores for leaderboard"""
-    rows = await conn.fetch(
+async def update_player_stats(
+    conn: asyncpg.Connection,
+    email: str,
+    correct_guesses: Optional[int],
+    correct_ejections: Optional[int],
+    incorrect_guesses: Optional[int],
+) -> dict:
+    """Update player statistics (incremental)"""
+
+    # Build dynamic update query
+    updates = []
+    params = [email]
+    param_count = 2
+
+    if correct_guesses is not None:
+        updates.append(f"correct_guesses = correct_guesses + ${param_count}")
+        params.append(correct_guesses)
+        param_count += 1
+
+    if correct_ejections is not None:
+        updates.append(f"correct_ejections = correct_ejections + ${param_count}")
+        params.append(correct_ejections)
+        param_count += 1
+
+    if incorrect_guesses is not None:
+        updates.append(f"incorrect_guesses = incorrect_guesses + ${param_count}")
+        params.append(incorrect_guesses)
+        param_count += 1
+
+    if not updates:
+        # No updates, just return current stats
+        return await get_player_stats(conn, email)
+
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+
+    query = f"""
+        UPDATE player_stats
+        SET {', '.join(updates)}
+        WHERE email = $1
+        RETURNING email, correct_guesses, correct_ejections, incorrect_guesses, updated_at
+    """
+
+    stats = await conn.fetchrow(query, *params)
+
+    if not stats:
+        raise HTTPException(status_code=404, detail="Player stats not found")
+
+    return dict(stats)
+
+
+async def add_chat_message(
+    conn: asyncpg.Connection, email: str, speaker: str, message: str
+) -> dict:
+    """Add a chat message to history"""
+    chat = await conn.fetchrow(
         """
-        SELECT
-            u.username,
-            gr.habitability_score,
-            gr.time_to_habitable,
-            gr.completed,
-            gr.created_at
-        FROM game_runs gr
-        JOIN users u ON gr.user_id = u.id
-        WHERE gr.completed = true
-        ORDER BY gr.habitability_score DESC, gr.time_to_habitable ASC
-        LIMIT $1
+        INSERT INTO chat_history (email, speaker, message)
+        VALUES ($1, $2, $3)
+        RETURNING id, email, speaker, message, timestamp
         """,
-        limit,
+        email,
+        speaker,
+        message,
     )
 
-    return [dict(row) for row in rows]
+    return dict(chat)
 
 
-async def get_user_runs(
-    conn: asyncpg.Connection, user_id: int, limit: int = 50
+async def get_chat_history(
+    conn: asyncpg.Connection, email: str, limit: int = 100
 ) -> List[dict]:
-    """Get game runs for a specific user"""
+    """Get chat history for a user"""
     rows = await conn.fetch(
         """
-        SELECT
-            id, user_id, completed, time_to_habitable, habitability_score,
-            run_duration, started_at, ended_at, created_at
-        FROM game_runs
-        WHERE user_id = $1
-        ORDER BY created_at DESC
+        SELECT id, email, speaker, message, timestamp
+        FROM chat_history
+        WHERE email = $1
+        ORDER BY timestamp DESC
         LIMIT $2
         """,
-        user_id,
+        email,
         limit,
     )
 
@@ -296,7 +294,7 @@ async def root():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Planet Evolution Game API",
+        "service": "Social Deduction Space Game API",
         "version": "1.0.0",
     }
 
@@ -304,28 +302,26 @@ async def root():
 @app.post("/api/users", response_model=UserResponse)
 async def create_or_get_user(user_data: UserCreate, conn=Depends(get_db)):
     """
-    Create a new user or get existing user by Auth0 ID
-    This should be called by the frontend after Auth0 authentication
+    Create a new user or get existing user by email
+    This should be called by the frontend after authentication
     """
     try:
-        user = await get_or_create_user(
-            conn, user_data.auth0_id, user_data.email, user_data.username
-        )
+        user = await get_or_create_user(conn, user_data.email)
         return UserResponse(**user)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create/get user: {str(e)}")
 
 
-@app.get("/api/users/{auth0_id}", response_model=UserResponse)
-async def get_user(auth0_id: str, conn=Depends(get_db)):
-    """Get user by Auth0 ID"""
+@app.get("/api/users/{email}", response_model=UserResponse)
+async def get_user(email: str, conn=Depends(get_db)):
+    """Get user by email"""
     user = await conn.fetchrow(
         """
-        SELECT id, auth0_id, email, username, created_at, updated_at
+        SELECT email, last_login, created_at
         FROM users
-        WHERE auth0_id = $1
+        WHERE email = $1
         """,
-        auth0_id,
+        email,
     )
 
     if not user:
@@ -334,73 +330,59 @@ async def get_user(auth0_id: str, conn=Depends(get_db)):
     return UserResponse(**dict(user))
 
 
-@app.post("/api/game-runs", response_model=GameRunResponse)
-async def submit_game_run(run_data: GameRunCreate, conn=Depends(get_db)):
+@app.get("/api/stats/{email}", response_model=PlayerStatsResponse)
+async def get_stats(email: str, conn=Depends(get_db)):
+    """Get player statistics"""
+    try:
+        stats = await get_player_stats(conn, email)
+        return PlayerStatsResponse(**stats)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+
+@app.post("/api/stats", response_model=PlayerStatsResponse)
+async def update_stats(stats_data: StatsUpdate, conn=Depends(get_db)):
     """
-    Submit a completed game run
-    This should be called by the frontend when a game session ends
+    Update player statistics (incremental)
+    Only increments the provided fields
     """
     try:
-        # Get or create user
-        user = await get_or_create_user(conn, run_data.auth0_id, None, None)
-
-        # Create game run
-        game_run = await create_game_run(conn, user["id"], run_data)
-
-        return GameRunResponse(**game_run)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to submit game run: {str(e)}")
-
-
-@app.get("/api/users/{auth0_id}/stats", response_model=UserStatsResponse)
-async def get_user_statistics(auth0_id: str, conn=Depends(get_db)):
-    """Get statistics for a specific user"""
-    # Get user
-    user = await conn.fetchrow(
-        "SELECT id FROM users WHERE auth0_id = $1", auth0_id
-    )
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Get stats
-    stats = await get_user_stats(conn, user["id"])
-
-    return UserStatsResponse(**stats)
-
-
-@app.get("/api/users/{auth0_id}/runs", response_model=List[GameRunResponse])
-async def get_user_game_runs(
-    auth0_id: str, limit: int = 50, conn=Depends(get_db)
-):
-    """Get game run history for a specific user"""
-    # Get user
-    user = await conn.fetchrow(
-        "SELECT id FROM users WHERE auth0_id = $1", auth0_id
-    )
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Get runs
-    runs = await get_user_runs(conn, user["id"], limit)
-
-    return [GameRunResponse(**run) for run in runs]
-
-
-@app.get("/api/leaderboard", response_model=List[LeaderboardEntry])
-async def get_game_leaderboard(limit: int = 100, conn=Depends(get_db)):
-    """
-    Get global leaderboard
-    Shows top scores sorted by habitability score and time to complete
-    """
-    try:
-        entries = await get_leaderboard(conn, limit)
-        return [LeaderboardEntry(**entry) for entry in entries]
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch leaderboard: {str(e)}"
+        stats = await update_player_stats(
+            conn,
+            stats_data.email,
+            stats_data.correct_guesses,
+            stats_data.correct_ejections,
+            stats_data.incorrect_guesses,
         )
+        return PlayerStatsResponse(**stats)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update stats: {str(e)}")
+
+
+@app.post("/api/chat", response_model=ChatMessageResponse)
+async def add_message(chat_data: ChatMessageCreate, conn=Depends(get_db)):
+    """Add a chat message to history"""
+    try:
+        chat = await add_chat_message(
+            conn, chat_data.email, chat_data.speaker, chat_data.message
+        )
+        return ChatMessageResponse(**chat)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add chat message: {str(e)}")
+
+
+@app.get("/api/chat/{email}", response_model=List[ChatMessageResponse])
+async def get_chat(email: str, limit: int = 100, conn=Depends(get_db)):
+    """Get chat history for a user"""
+    try:
+        messages = await get_chat_history(conn, email, limit)
+        return [ChatMessageResponse(**msg) for msg in messages]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get chat history: {str(e)}")
 
 
 # ============================================================================
